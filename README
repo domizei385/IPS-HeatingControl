@@ -1,1 +1,13 @@
-Repository für IP-Symcon Homematic Heizungssteuerung
+Repository for IP-Symcon Homematic HeatingControl
+
+Installation:
+Create script and drop the contents of HeatingControl_Installation.ips.php into the file. Then execute it.
+
+Features:
+- Setting target temperatures of a room on a day and time basis (this is depending on the actual homematic hysteresis calculation, but it should be accurate within the range of +1 degree.)
+- Fungus prevention:
+	- Increasing temperature based on humidity values (as a warmer room stores more humidity this can delay condensation of water on your wall in order to prevent fungus)
+	- Calculation and display of "absolute humidity" values: When the absolute humidity outdoors is higher than the one indoors, do not try to open your window.
+- Decrease temperature depending on a switch state such as a window/door
+- "Away" switch: when set the temperature will be set to a different value
+- Homematic value stall recovery: When a homematic valve occasionally gets stuck at a value of 1-7%, the temperature will be increased automatically. As soon as the valve opening changes the temperature will be set to normal.
