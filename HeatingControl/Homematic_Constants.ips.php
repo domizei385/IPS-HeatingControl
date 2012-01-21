@@ -1,16 +1,24 @@
 <?
 
-	// rooms
+	// controls
 	define("r_BATH",		"BATH");
 	define("r_KITCHEN",		"KITCHEN");
 	define("r_LIVING",		"LIVING");
 	define("r_SLEEP",		"SLEEP");
 	
+	// watches
+	define("w_FRIDGE",		"FRIDGE");
+	
 	// objects
+	define("o_TYPE",			"TYPE");
 	define("o_WINDOW",  		"WINDOW");
 	define("o_TEMP_CONTROL",	"TEMP_CONTROL");
 	define("o_CLIMATE",			"CLIMATE");
 	define("o_VALVES",			"VALVES");
+	
+	// types
+	define("tp_CONTROL",		"TYPE_CONTROL");
+	define("tp_WATCH",			"TYPE_WATCH");
 	
 	// vars
 	define("t_REFERENCE",  		"REFERENCE");
@@ -52,9 +60,19 @@
 	// category names
 	define("ct_CLIMATE",		"Klima");
 	
+	define("lang_HEATING_CONTROL",		"Heizungssteuerung");
+	define("lang_ABS_HUMIDITY",			"abs. Feuchtigkeit");
+	define("lang_WINDOW",				"Fenster");
+	define("lang_PRESERVE_VALUE_SET",	"Automatik: %.1f°C. Manuell überschrieben bis ");
+	define("lang_TARGET_TEMPERATURE",	"Zieltemperatur");
+	define("lang_OVERRIDE_OPEN_WINDOW",	"Offenes Fenster ignorieren");
+	
+	define("ident_PRESERVE_VALUE_SET",			"PRESERVE_VALUE_UNTIL");
+	
 	// semi variables
 	define("c_ID_presence",		13075);
 	define("c_ID_state",		41419);
 	define("c_ID_rooms",		14951);
+	define("s_ID_IgnoreWindow",	13326);
 	
 ?>

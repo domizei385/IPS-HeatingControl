@@ -17,6 +17,7 @@
 	IPS_SetParent($IPS_SELF, $CategoryIdControl);
 	$ScriptIdPresence = CreateScript('PresenceSwitcher',  'HeatingControl_PresenceSwitch.ips.php', $CategoryIdControl, 11);
 	$ScriptIdIgnoreWindow = CreateScript('IgnoreWindow',  'HeatingControl_IgnoreWindow.ips.php', $CategoryIdControl, 12);
+	SetVariableConstant("s_ID_IgnoreWindow", $ScriptIdIgnoreWindow, "HeatingControl\Homematic_Constants.ips.php");
 	
 	echo "--- Adding presence control ----------------------------------------------------------\n";
 	$ControlIdPresence  = CreateVariable("Presence",  0 /*Boolean*/, $CategoryIdRooms, 10, 'Presence_Editable', $ScriptIdPresence, null, 'Motion');
