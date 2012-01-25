@@ -4,7 +4,7 @@ include_once "IPSLogger.ips.php";
 include_once "Homematic_AbstractDevice.ips.php";
 include_once "ITemperatureControl.ips.php";
 
-class HomematicClimateControl extends AbstractHomematicDevice implements ITemperatureControl {
+class HomematicClimateControl extends AbstractDevice implements ITemperatureControl {
     private $targetTempReadId;
     
     public function setTargetTemperatureReadId($id) {

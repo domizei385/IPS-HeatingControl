@@ -1,5 +1,6 @@
 <?
 	include_once "IPSLogger.ips.php";
+	include_once "HeatingControl\HeatingControl_RoomState.ips.php";
 	include_once "HeatingControl\Homematic_ClimateControl.ips.php";
 	include_once "HeatingControl\Homematic_Constants.ips.php";
 	include_once "HeatingControl\HeatingConfiguration.ips.php";
@@ -8,7 +9,6 @@
 	include_once "IPSInstaller.ips.php";
 	
 	/* TODO:
-	- show temperature override TIME VALIDITY in WebFront
 	- add selection (similar to "Temperature.HM") for TIME in UI ( to be able to extend the override)
 	- 
 	- implement AUTO_AWAY logic (based on TV, Receiver, Computer usage, bewegungsmelder)?
@@ -17,6 +17,7 @@
 	/*
 	04.12.2011: - add UI switch: ignore WINDOW_OPEN_SWITCH
 	19.12.2011: - stop valve stall by increasing temperature for a short time and then decreasing it again
+	20.01.2012: - show temperature override TIME VALIDITY in WebFront
 	*/
 	define("OVERRIDE_DURATION", 60); // in minutes
 	define("VALVE_STALL_LIMIT", 4); // in hours. Time frame in, which a valve has to change its value.
@@ -24,6 +25,11 @@
 	
 	if(!IPS_CategoryExists(c_ID_state) || !IPS_CategoryExists(c_ID_rooms) || !IPS_VariableExists(c_ID_presence)) {
 		die("Heating control does not seem to be properly installed.");
+	}
+	
+	function setVariableLogging($varId, $enabled = true) {
+		AC_SetLoggingStatus(48801 /*[Archive Handler]*/, $varId, $enabled);
+		IPS_ApplyChanges($varId);
 	}
 	
 	function hasOpenWindow($windowIds) {
@@ -39,9 +45,7 @@
 		return $isWindowOpen;
 	}
 	
-	function evaluateTargetTemperature($ids, $config, $isAway, $shouldPreserveValue, $roomCategory, $roomWindowOpen) {
-		global $day_order;
-		
+	function isStallRecoveryRunning($ids, $roomCategory) {
 		$categoryObject = IPS_GetObject($roomCategory);
 		$roomName = $categoryObject["ObjectName"];
 		
@@ -109,23 +113,23 @@
 			}
 			
 			if($stallRecoveryRunning) {
-				return 30;
+				return true;
 			}
 		}
-		
-		$targetTemp = 20;
+		return false;
+	}
+	
+	/**
+	 * Returns false, if isAway and roomWindowOpen are both set to "false".
+	 */
+	function getAwayWindowOpenTemperature($isAway, $roomWindowOpen, $config) {
 		$windowOpenTemp = null;
 		$awayTemp = null;
+		$newTargetTemp = 20;
 		
 		// check for "window open" temperature
 		if($roomWindowOpen) {
-			// check external override condition
-			$ignoreWindowState = isset($window[v_OVERRIDE]) && GetValue($window[v_OVERRIDE]);
-			if($ignoreWindowState) {
-				// found an open window but choose to ignore it
-			} else {
-				$windowOpenTemp = $config[t_WINDOW_OPEN];
-			}
+			$windowOpenTemp = $config[t_WINDOW_OPEN];
 		}
 		
 		// check for AWAY temperature
@@ -135,19 +139,20 @@
 		
 		// check for lowest temperature of windowOpen and away and return it
 		if($windowOpenTemp != null || $awayTemp != null) {
-			if($windowOpenTemp != null && $windowOpenTemp < $targetTemp) {
-				$targetTemp = $windowOpenTemp;
+			if($windowOpenTemp != null && $windowOpenTemp < $newTargetTemp) {
+				$newTargetTemp = $windowOpenTemp;
 			}
-			if($awayTemp != null && $awayTemp < $targetTemp) {
-				$targetTemp = $awayTemp;
+			if($awayTemp != null && $awayTemp < $newTargetTemp) {
+				$newTargetTemp = $awayTemp;
 			}
-			return $targetTemp;
+			return $newTargetTemp;
 		}
 		
-		// preserve value is overridden by stall recovery, an open window and AWAY only
-		if($shouldPreserveValue) {
-			return false;
-		}
+		return false;
+	}
+	
+	function evaluateTargetTemperature($ids, $config, $roomCategory) {
+		global $day_order;
 		
 		$daysConfig = $config[t_DAYS];
 		$currentDayNumber = date("N") - 1;
@@ -169,8 +174,8 @@
 			IPSLogger_Wrn(__file__, "No matching config found. Using first one\n");
 			$bestConf = $daysConfig[0];
 		}
-		$targetTemp = $bestConf[tp_TARGET];
-		// IPSLogger_Dbg(__file__, "Daytime-based target temperature: ".$targetTemp);
+		$newTargetTemp = $bestConf[tp_TARGET];
+		// IPSLogger_Dbg(__file__, "Daytime-based target temperature: ".$newTargetTemp);
 		
 		// check if we need to take the humidity into account (requires HUMIDITY reading)
 		if(isset($config[t_HUMIDITY])) {
@@ -190,61 +195,77 @@
 						$currentIncrease = $humValues[x_HUMIDITY_TEMP_INC];
 					}
 				}
-				$targetTemp += $currentIncrease;
+				$newTargetTemp += $currentIncrease;
 				//IPSLogger_Dbg(__file__, "Humidity-based temperature increase: ".$currentIncrease);
 			}
 		}
-		return $targetTemp;
+		return $newTargetTemp;
 	}
 	
-	function shouldPreserveValue($currentTimeStamp, $roomName, $roomCategory, $roomWindowOpen, $HM_targetTempVarId) {
-		// check whether updates are temporarily locked (Preserved)
-		
-		// get or create "LAST_UPDATE" variable (timestamp, when this scripts changed the setting last)
-		$lastUpdateId = CreateVariable("LAST_UPDATE",  1, $roomCategory, 0, '', '', null, '');
-		// get or create "LAST_HM_UPDATE" variable (timestamp, when the setting was last changed by homematic e.g. manually changing the setting on the control unit)
-		$lastHMUpdateId = CreateVariable("LAST_HM_UPDATE",  1, $roomCategory, 0, '', '', null, '');
-		$lastHMUpdate = GetValue($lastHMUpdateId);
-		// get or create "PRESERVE_UNTIL" variable (timestamp until this script will ignore changing the temperature setting)
-		$preserveUntilId = CreateVariable("PRESERVE_UNTIL",  1, $roomCategory, 0, '', '', null, '');
-		$preserveUntil = GetValue($preserveUntilId);
+	/**
+	 * Check whether updates are temporarily locked (Preserved)
+	 */
+	function shouldPreserveValue($currentTimeStamp, $roomName, $climateControl, $roomState, $currentAutoTemp) {
+		// clear preserve value if it has expired
+		$preserveUntil = $roomState->preserveUntil->value;
+		$hasValidPreserveValue = false;
 		if($preserveUntil != 0 && $preserveUntil <= $currentTimeStamp) {
-			$preserveUntil = 0;
+			$roomState->resetPreserveUntil();
 			IPSLogger_Dbg(__file__, "Preserving value expired in ".$roomName);
-			SetValue($preserveUntilId, $preserveUntil);
+		} else if($preserveUntil != 0) {
+			$hasValidPreserveValue = true;
 		}
+		unset($preserveUntil);
 		
 		// get time stamp of last HM based change
-		$HM_variableDetails = IPS_GetVariable($HM_targetTempVarId);
-		$HM_variableUpdated = round($HM_variableDetails["VariableChanged"]);
+		$currentTargetTempDetails = IPS_GetVariable($climateControl->getTargetTemperatureReadId());
+		$currentTargetTempUpdated = round($currentTargetTempDetails["VariableChanged"]);
+		
 		// set initial value
-		if($lastHMUpdate == 0) {
-			$lastHMUpdate = $HM_variableUpdated;
-			SetValue($lastHMUpdateId, $lastHMUpdate);
+		if($roomState->lastHMUpdate->value == 0) {
+			$lastHMUpdate = $currentTargetTempUpdated;
+			$roomState->lastHMUpdate->value = lastHMUpdate;
 		}
+		
+		$lastUpdateId = $roomState->lastUpdate->variableId;
 		$IPS_variableDetails = IPS_GetVariable($lastUpdateId);
 		$IPS_variableUpdated = round($IPS_variableDetails["VariableChanged"]);
+		
 		$shouldPreserve = false;
 		
-		// print("HM :".$HM_variableUpdated."\n");
+		// print("HM :".$currentTargetTempUpdated."\n");
 		// print("IPS:".$IPS_variableUpdated."\n\n");
 		
 		// outside update occurred -> preserve value for 1 hour
-		if($HM_variableUpdated > $IPS_variableUpdated) {
-			if($lastHMUpdate < $HM_variableUpdated) {
+		if($currentTargetTempUpdated > $IPS_variableUpdated) {
+			$preserveUntil = $roomState->preserveUntil->value;
+			if($roomState->lastHMUpdate->value < $currentTargetTempUpdated) {
 				IPSLogger_Dbg(__file__, "Setting new preserve value in ".$roomName);
 				
 				// print("new preserve: ".$preserveUntil."\n");
-				SetValue($lastHMUpdateId, $HM_variableUpdated);
+				$roomState->lastHMUpdate->value = $currentTargetTempUpdated;
 				
-				$preserveUntil = $HM_variableUpdated + 60 * OVERRIDE_DURATION;
-				SetValue($preserveUntilId, $preserveUntil);
+				$preserveUntil = $currentTargetTempUpdated + 60 * OVERRIDE_DURATION;
+				$roomState->preserveUntil->value = $preserveUntil;
 				$shouldPreserve = true;
-			} else if($preserveUntil != 0 && $preserveUntil > $HM_variableUpdated) {
+			} else if($preserveUntil != 0 && $preserveUntil > $currentTargetTempUpdated) {
 				// preserve value is set and valid;
 				$shouldPreserve = true;
 			}
 		}
+		
+		if($hasValidPreserveValue) {
+			$shouldPreserve = $hasValidPreserveValue;
+		}
+		
+		$currentTargetTemp = $climateControl->getTargetTemperature();
+		$lastTargetTemperature = $roomState->lastTargetTemperature->value;
+		if($shouldPreserve && $currentAutoTemp == $currentTargetTemp) {
+			IPSLogger_Trc(__file__, "Should preserve but temperatures matching. Disabling preserve value.");
+			$roomState->resetPreserveUntil();
+			$shouldPreserve = false;
+		}
+		
 		return $shouldPreserve;
 	}
 	
@@ -285,10 +306,15 @@
 							$roomAbsHumidity = $varObject["VariableValue"]["ValueInteger"];
 						}
 						
-						if($roomTemperature !== false && $roomHumidity !== false) break;
+						if($roomTemperature !== false && $roomHumidity !== false && $roomAbsHumidity !== false) break;
 					}
 					$absHumidity = round(calculateAbsoluteHumidity($roomTemperature, $roomHumidity), 2);
-					$absHumidityId = CreateVariable("ABS_HUMIDITY",  2, $targetRoomCategory, 0, 'Abs.Humidity', '', $absHumidity, '');
+					$absHumidityId = IPS_GetVariableIDByName("ABS_HUMIDITY", $targetRoomCategory);
+					if($absHumidityId === false) {
+						$absHumidityId = CreateVariable("ABS_HUMIDITY",  2, $targetRoomCategory, 0, 'Abs.Humidity', '', $absHumidity, '');
+					} else {
+						SetValue($absHumidityId, $absHumidity);
+					}
 					
 					// create link to absolute humidity variable in source "Klima" instance
 					if($roomAbsHumidity == false) {
@@ -322,24 +348,31 @@
 			
 			if($deviceModuleName == "HomeMatic Device") {
 				$ccc = new HomematicClimateControl($objectIds[o_TEMP_CONTROL][v_SET]);
+				$ccc->setTargetTemperatureReadId($objectIds[o_TEMP_CONTROL][v_GET]);
 				$ccc->setLocation($objectName);
-				
-				$HM_targetTempVarId = $objectIds[o_TEMP_CONTROL][v_GET];
-				$ccc->setTargetTemperatureReadId($HM_targetTempVarId);
 				
 				// search for category with name "objectName"
 				$roomCategory = CreateCategory($objectName, c_ID_state, 10);
+				$roomState = new RoomState($roomCategory);
 				
-				// create aggregate which can be used by webfront etc.
-				$heatingControlModuleId = CreateDummyInstance(lang_HEATING_CONTROL, $roomCategory, 100);
+				if($objectName != "KITCHEN") {
+					continue;
+				}
 				
-				//CreateLink(lang_TARGET_TEMPERATURE, $objectIds[o_TEMP_CONTROL][v_GET], $heatingControlModuleId, 50);
+				if(isStallRecoveryRunning($objectIds, $roomCategory)) {
+					$ccc->setTargetTemperature(30);
+					continue;
+				}
 				
-				$lastTargetTemperatureId = CreateVariable("LAST_TARGET_TEMPERATURE",  2, $roomCategory, 0, '', '', null, '');
-				$lastTargetTemperature = GetValue($lastTargetTemperatureId);
+				// create aggregate to encapsulate all important heating controls, which can be used by webfront etc.
+				$heatingControlModuleId = IPS_GetInstanceIDByName(lang_HEATING_CONTROL, $roomCategory);
+				if($heatingControlModuleId === false) {
+					$heatingControlModuleId = CreateDummyInstance(lang_HEATING_CONTROL, $roomCategory, 100);
+				}
+				// CreateLink(lang_TARGET_TEMPERATURE, $objectIds[o_TEMP_CONTROL][v_GET], $heatingControlModuleId, 50);
 				
 				// check if there is an open window that we dont want to ignore
-				$roomWindowOpen = false;
+				$roomWindowOpen = $ignoreWindowOpen = false;
 				if(isset($objectIds[o_WINDOW])) {
 					$window = $objectIds[o_WINDOW];
 					if(isset($window[v_STATE])) {
@@ -350,8 +383,7 @@
 							
 							if(@IPS_GetVariableIDByName($text, $heatingControlModuleId) == false) {
 								$targetVariableId = CreateVariable($text, 0 /* Boolean */, $heatingControlModuleId, 1, 'Windows-Color', '', null, 'Window');
-								AC_SetLoggingStatus(48801 /*[Archive Handler]*/, $targetVariableId, true);
-								IPS_ApplyChanges($targetVariableId);
+								setVariableLogging($targetVariableId);
 								
 								// create change event on source
 								$script = "SetValueBoolean($targetVariableId, GetValueBoolean($sourceVariableId));";
@@ -364,11 +396,11 @@
 							$varId = @IPS_GetVariableIDByName(lang_OVERRIDE_OPEN_WINDOW, $heatingControlModuleId);
 							if($varId == false) {
 								$varId = CreateVariable(lang_OVERRIDE_OPEN_WINDOW, 0 /* Boolean */, $heatingControlModuleId, 1, 'WindowIgnore', s_ID_IgnoreWindow, false, 'Window');
-								AC_SetLoggingStatus(48801 /*[Archive Handler]*/, $varId, true);
-								IPS_ApplyChanges($varId);
+								setVariableLogging($varId);
 							}
 							IPS_SetHidden($varId, false);
-							$roomWindowOpen = true && !GetValue($varId);
+							$roomWindowOpen = true;
+							$ignoreWindowOpen = GetValue($varId);
 						} else {
 							$varId = @IPS_GetVariableIDByName(lang_OVERRIDE_OPEN_WINDOW, $heatingControlModuleId);
 							if($varId != false) {
@@ -381,49 +413,86 @@
 					}
 				}
 				
-				$shouldPreserve = shouldPreserveValue($currentTimeStamp, $objectName, $roomCategory, $roomWindowOpen, $HM_targetTempVarId);
-				// IPSLogger_Inf(__file__, "LAST:".GetValue($lastTargetTemperatureId));
-				// IPSLogger_Inf(__file__, "TARGET:".$ccc->getTargetTemperature());
-				$preserveUntilId = CreateVariable("PRESERVE_UNTIL",  1, $roomCategory, 0, '', '', null, '');
-				$oldTargetTemp = $ccc->getTargetTemperature();
-				if($shouldPreserve && $lastTargetTemperature == $oldTargetTemp) {
-					IPSLogger_Trc(__file__, "Should preserve but temperatures matching. Disabling preserve value.");
-					SetValue($preserveUntilId, 0);
-					$shouldPreserve = false;
+				$newAutoTemperature = evaluateTargetTemperature($objectIds, $config[$objectName], $roomCategory);
+				
+				$considerOpenWindow = $roomWindowOpen && !$ignoreWindowOpen;
+				$shouldPreserve = false;
+				if(!$considerOpenWindow) {
+					$shouldPreserve = shouldPreserveValue($currentTimeStamp, $objectName, $ccc, $roomState, $newAutoTemperature);
+					//echo "should preserve: ".($shouldPreserve  ?"true":"false")."\n";
+					$preserveUntilVarId = @IPS_GetObjectIDByIdent(ident_PRESERVE_VALUE_SET, $heatingControlModuleId);
+					if($shouldPreserve) {
+						$timestamp = $roomState->preserveUntil->value;
+						// TODO: maybe display as remaining minutes
+						$formattedTime = date("H:i", $timestamp);
+						$varTitle = sprintf(lang_PRESERVE_VALUE_SET, $newAutoTemperature);
+						if($preserveUntilVarId === false) {
+							// TODO: offer time selection to extend validity of value
+							$preserveUntilVarId = CreateVariable($varTitle, 3 /* String */, $heatingControlModuleId, 10, '', '', $formattedTime, '');
+							IPS_SetIdent($preserveUntilVarId, ident_PRESERVE_VALUE_SET);
+						} else {
+							IPS_SetName($preserveUntilVarId, $varTitle);
+							SetValue($preserveUntilVarId, $formattedTime);
+						}
+					} else {
+						if($preserveUntilVarId !== false) {
+							IPS_DeleteVariable($preserveUntilVarId);
+							$preserveUntilVarId = false;
+						}
+					}
 				}
 				
-				$preserveUntilVarId = @IPS_GetObjectIDByIdent(ident_PRESERVE_VALUE_SET, $heatingControlModuleId);
-				if($shouldPreserve) {
-					$timestamp = GetValue($preserveUntilId);
-					// TODO: maybe display minutes
-					$formattedTime = date("H:i", $timestamp);
-					$varTitle = sprintf(lang_PRESERVE_VALUE_SET, $lastTargetTemperature);
-					if($preserveUntilVarId === false) {
-						// TODO: offer time selection to extend validity of value
-						$preserveUntilVarId = CreateVariable($varTitle, 3 /* String */, $heatingControlModuleId, 10, '', '', $formattedTime, '');
-						IPS_SetIdent($preserveUntilVarId, ident_PRESERVE_VALUE_SET);
+				$currentTargetTemp = $ccc->getTargetTemperature();
+				$newTargetTemp = getAwayWindowOpenTemperature(!$isPresent, $considerOpenWindow, $config[$objectName]);
+				
+				$windowStateChanged = $roomState->previousWindowState->value != $considerOpenWindow;
+				$windowJustOpened = $windowStateChanged && $considerOpenWindow;
+				//echo "ConsiderWindow: ".($considerOpenWindow  ?"1":"0")." - WJustOpened: ".($windowJustOpened ?"1":"0")."\n";
+				//echo "Kit: WStateChanged: ".($windowStateChanged ?"1":"0")." - roomWindowOpen: ".($roomWindowOpen ?"1":"0")."\n";
+				
+				if($windowStateChanged) {
+					if($roomWindowOpen && !$ignoreWindowOpen) {
+						// window was just opened - backup to "lastTargetTemp"
+						$roomState->lastTargetTemperature->value = $currentTargetTemp;
+						echo "window opened - stored: ".$roomState->lastTargetTemperature->value."°C\n";
+					} else if($roomWindowOpen && $ignoreWindowOpen) {
+						// restore persisted temperature
+						$newTargetTemp = $roomState->lastTargetTemperature->value;
+						echo "window ignored - restoring: ".$roomState->lastTargetTemperature->value."°C\n";
 					} else {
-						IPS_SetName($preserveUntilVarId, $varTitle);
-						SetValue($preserveUntilVarId, $formattedTime);
+						// window was just closed -> restore from "lastTargetTemp"
+						if($roomState->preserveUntil->value > time()) {
+							$newTargetTemp = $roomState->lastTargetTemperature->value;
+							echo "window closed - stored: ".$roomState->lastTargetTemperature->value."°C\n";
+						} else {
+							$roomState->lastTargetTemperature->value = 0;
+						}
+					}
+				}
+				
+				if($newTargetTemp == false) {
+					if($shouldPreserve) {
+						$newTargetTemp = $currentTargetTemp;
+						//echo "PRESERVE TEMP: $newTargetTemp"."\n";
+					} else {
+						// no temp overrides set, use evaluated temperature
+						$newTargetTemp = $newAutoTemperature;
+						//echo "NORMAL TEMP: $newTargetTemp"."\n";
 					}
 				} else {
-					if($preserveUntilVarId !== false) {
-						IPS_DeleteVariable($preserveUntilVarId);
-						$preserveUntilVarId = false;
-					}
+					//echo "AWAY WINDOW TEMP: $newTargetTemp"."\n";
 				}
 				
-				//IPSLogger_Inf(__file__, $objectName);
-				//if($objectName == "LIVING" || $objectName == "SLEEP")
-					$targetTemp = evaluateTargetTemperature($objectIds, $config[$objectName], !$isPresent, $shouldPreserve, $roomCategory, $roomWindowOpen);
-				//else
-				//   continue;
 				
-				if($targetTemp !== false && $targetTemp != $oldTargetTemp) {
-					$lastUpdateId = CreateVariable("LAST_UPDATE",  1, $roomCategory, 0, '', '', null, '');
-					$ccc->setTargetTemperature($targetTemp);
-					SetValue($lastUpdateId, time());
-					SetValue($lastTargetTemperatureId, $targetTemp);
+				if($newTargetTemp != $currentTargetTemp) {
+					//echo "NewTargetTemp: $newTargetTemp - CurrentTargetTemp: ".$currentTargetTemp."\n";
+					//echo "isPreserve: ".$roomState->isPreserveSet()." - TempDiff: ".($currentTargetTemp != $roomState->lastTargetTemperature->value)."\n";
+					
+					$ccc->setTargetTemperature($newTargetTemp);
+					$roomState->lastUpdate->value = time();
+				}
+				if($windowStateChanged) {
+					$roomState->previousWindowState->value = $considerOpenWindow;
 				}
 			} else {
 				IPSLogger_Err(__file__, "Device not supported: ".$deviceModuleName);
